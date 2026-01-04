@@ -1,0 +1,110 @@
+stages:
+  - prepare
+  - build
+  - artifacts
+
+variables:
+  ANDROID_API_LEVEL: "21"
+  ANDROID_NDK_VERSION: "r25b"
+  TOOLCHAIN: "arm-linux-androideabi"
+  ANDROID_ABI: "armeabi-v7a"
+  PREFIX: "$CI_PROJECT_DIR/android-build"
+
+before_script:
+  # základní info
+  - uname -a
+  - echo "Starting build for Android API $ANDROID_API_LEVEL"
+
+prepare_ndk:
+  image: alpine:latest
+  stage: prepare
+  script:
+    - apk add --no-cache curl unzip
+    # stáhni Android NDK
+    - |
+      curl -L https://dl.google.com/android/repository/android-ndk-${ANDROID_NDK_VERSION}-linux.zip \
+        -o android-ndk.zip
+    - unzip android-ndk.zip
+    - mv android-ndk-${ANDROID_NDK_VERSION} ndk
+    - chmod +x ndk/*
+    # vytvoř standalone toolchain
+    - export TOOLCHAIN_PATH="$CI_PROJECT_DIR/ndk/toolchains/llvm/prebuilt/linux-x86_64"
+    - export PATH="$TOOLCHAIN_PATH/bin:$PATH"
+    # ověř clang
+    - clang --version
+    - mkdir -p $PREFIX
+
+  artifacts:
+    paths:
+      - ndk/
+    expire_in: 1 day
+
+build_sshfs:
+  image: ubuntu:22.04
+  stage: build
+  dependencies:
+    - prepare_ndk
+  script:
+    - apt update && apt install -y build-essential python3 python3-pip meson ninja-build pkg-config
+    # NDK toolchain setup
+    - export ANDROID_NDK_HOME="$CI_PROJECT_DIR/ndk"
+    - export TOOLCHAIN_PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+    - export PATH="$TOOLCHAIN_PATH/bin:$PATH"
+
+    # cross-compile nastavení
+    - export CC="${TOOLCHAIN_PATH}/bin/armv7a-linux-androideabi${ANDROID_API_LEVEL}-clang"
+    - export CXX="${TOOLCHAIN_PATH}/bin/armv7a-linux-androideabi${ANDROID_API_LEVEL}-clang++"
+    - export AR="${TOOLCHAIN_PATH}/bin/llvm-ar"
+    - export LD="${TOOLCHAIN_PATH}/bin/ld.lld"
+    - export STRIP="${TOOLCHAIN_PATH}/bin/llvm-strip"
+    - export PKG_CONFIG_ALLOW_CROSS=1
+
+    # konfigurace Meson cross file
+    - cat > android_armv7a_cross.txt <<'EOF'
+      [binaries]
+      c = '$CC'
+      cpp = '$CXX'
+      ar = '$AR'
+      strip = '$STRIP'
+      ld = '$LD'
+
+      [properties]
+      sys_root = '$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot'
+      needs_exe_wrapper = true
+
+      [host_machine]
+      system = 'android'
+      cpu_family = 'arm'
+      cpu = 'armv7'
+      endian = 'little'
+      EOF
+
+    # vytvoř build adresář
+    - mkdir -p build_android
+    - cd build_android
+
+    # Meson configure
+    - meson setup --cross-file ../android_armv7a_cross.txt \
+        --prefix=$PREFIX \
+        -Dstrip=true \
+        -Db_lto=false \
+        -Dtests=false \
+        ../
+
+    # build a install
+    - ninja
+    - ninja install
+
+    # výstupní binárky
+    - file $PREFIX/bin/sshfs
+
+  artifacts:
+    paths:
+      - android-build/
+    expire_in: 1 year
+
+test_none:
+  stage: artifacts
+  script:
+    - echo "No runtime tests in CI"
+  when: manual
